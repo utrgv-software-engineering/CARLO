@@ -1,11 +1,13 @@
 import numpy as np
+import torch
 from world import World
 from agents import Car, RingBuilding, CircleBuilding, Painting, Pedestrian
 from geometry import Point
 import time
 from tkinter import *
+from dql_agent import DQLAgent
 
-human_controller = True
+human_controller = False
 
 dt = 0.1 # time steps in terms of seconds. In other words, 1/dt is the FPS.
 world_width = 120 # in meters
@@ -46,36 +48,102 @@ c1.max_speed = 30.0 # let's say the maximum is 30 m/s (108 km/h)
 c1.velocity = Point(0, 3.0)
 w.add(c1)
 
-w.render() # This visualizes the world we just constructed.
+#w.render() # This visualizes the world we just constructed.
 
 
 
 if not human_controller:
-    # Let's implement some simple policy for the car c1
-    desired_lane = 1
-    for k in range(600):
-        lp = 0.
-        if c1.distanceTo(cb) < desired_lane*(lane_width + lane_marker_width) + 0.2:
-            lp += 0.
-        elif c1.distanceTo(rb) < (num_lanes - desired_lane - 1)*(lane_width + lane_marker_width) + 0.3:
-            lp += 1.
+    # Training settings
+    EPISODES = 1000
+    batch_size = 32
+    
+    # Initialize DQL agent
+    state_size = 4  # distance_to_center, velocity, heading_diff, heading
+    action_size = 15  # 5 steering actions * 3 throttle actions
+    agent = DQLAgent(state_size, action_size)
+    
+    for episode in range(EPISODES):
+        # Reset the environment
+        c1.center = Point(91.75, 60)
+        c1.heading = np.pi/2
+        c1.velocity = Point(0, 3.0)
         
-        v = c1.center - cb.center
-        v = np.mod(np.arctan2(v.y, v.x) + np.pi/2, 2*np.pi)
-        if c1.heading < v:
-            lp += 0.7
-        else:
-            lp += 0.
+        # Add lap tracking variables
+        last_angle = np.arctan2(c1.center.y - world_height/2, c1.center.x - world_width/2)
+        lap_count = 0
+        crossed_start = False
         
-        if np.random.rand() < lp: c1.set_control(0.2, 0.1)
-        else: c1.set_control(-0.1, 0.1)
+        total_reward = 0
+        for time_step in range(600):
+            # Get current state
+            state = agent.get_state(c1, cb)
+            
+            # Track laps
+            current_angle = np.arctan2(c1.center.y - world_height/2, c1.center.x - world_width/2)
+            angle_diff = current_angle - last_angle
+            if angle_diff > np.pi:
+                angle_diff -= 2*np.pi
+            elif angle_diff < -np.pi:
+                angle_diff += 2*np.pi
+                
+            # Check if car crossed starting position (bottom of circle)
+            if current_angle > 0 and last_angle < 0 and angle_diff > 0:
+                if crossed_start:
+                    lap_count += 1
+                    reward += 1000  # Bonus reward for completing a lap
+                crossed_start = True
+                
+            last_angle = current_angle
+            
+            # Get action from agent
+            steering, throttle = agent.act(state)
+            c1.set_control(steering, throttle)
+            
+            # Advance simulation
+            w.tick()
+            #w.render()
+            
+            # Calculate reward
+            distance_to_center = c1.distanceTo(cb)
+            desired_distance = inner_building_radius + lane_width/2
+            distance_error = abs(distance_to_center - desired_distance)
+            
+            reward = 1.0  # Base reward for surviving
+            reward -= distance_error * 0.1  # Penalty for being off-center
+            reward -= abs(steering) * 0.1  # Small penalty for steering
+            
+            # Get new state
+            next_state = agent.get_state(c1, cb)
+            
+            # Check if episode is done
+            done = False
+            if w.collision_exists():
+                reward = -1000  # Big penalty for collision
+                done = True
+            
+            # Store experience in memory
+            action_idx = (agent.steering_actions.index(steering) * 
+                         len(agent.throttle_actions) + 
+                         agent.throttle_actions.index(throttle))
+            agent.remember(state, action_idx, reward, next_state, done)
+            
+            # Train the network
+            agent.replay(batch_size)
+            
+            total_reward += reward
+            
+            if done:
+                break
         
-        w.tick() # This ticks the world for one time step (dt second)
-        w.render()
-        time.sleep(dt/4) # Let's watch it 4x
-
-        if w.collision_exists(): # We can check if there is any collision at all.
-            print('Collision exists somewhere...')
+        # Update target network every episode
+        agent.update_target_model()
+        
+        print(f"Episode: {episode + 1}/{EPISODES}, Score: {total_reward}")
+        
+        # Save the model periodically
+        if episode % 100 == 0:
+            torch.save(agent.model.state_dict(), f'dql_agent_episode_{episode}.pth')
+    
     w.close()
 
 else: # Let's use the keyboard input for human control
